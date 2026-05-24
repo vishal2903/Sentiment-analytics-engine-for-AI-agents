@@ -247,6 +247,18 @@ Core libraries:
 
 ---
 
+### 8. run_clustering_pipeline Data Access: Offline Store vs REST vs psycopg2+register_vector
+
+Decision: `.cache/embeddings.npy` offline store — same pattern as `scripts/02_cluster.py` (Phase 2).
+
+**Rejected:**
+- REST (PostgREST): serializes the `vector` column as a JSON string, not a float array — the pipeline cannot parse it. 1000-row hard cap causes silent truncation on a 27k-row dataset. ~165MB HTTP overhead per re-cluster run with no upside.
+- psycopg2 + `register_vector`: technically fixes the type and row-cap issues, but contradicts the project's documented layer rule — DB is the serving layer, `.cache/` is the ML data layer. Introducing a second DB access path for the same ML job creates ambiguity and erodes the rule that prevents the REST anti-pattern from recurring.
+
+Chosen because it is the pattern already proven in Phase 2, costs zero network, and is consistent with the anti-pattern rules already established. Production path: versioned Parquet on S3, same clustering logic, swap file path only.
+
+---
+
 ## Assumptions
 
 **K=27 is for validation, not production**

@@ -34,7 +34,7 @@ CLUSTERING JOB
   ProcessPoolExecutor keeps CPU work out of FastAPI event loop
   UMAP: 1536 dims -> 5 dims, cosine neighborhood preservation
   K-Means: K=27 demo, silhouette sweep in production
-  ARI: validates against Bitext ground-truth intents
+  ARI: validates against Bitext ground-truth intents (ARI=0.67, target >0.3)
         |
         v
 INSIGHT JOB
@@ -97,11 +97,12 @@ Why Postgres + pgvector:
 
 | Method | Endpoint | Purpose | Behavior |
 |---|---|---|---|
-| `POST` | `/ingest` | Accept conversation JSON | Validates, embeds, stores |
-| `POST` | `/analyze` | Trigger clustering run | Returns `202` + `job_id`; CPU work runs in process pool |
-| `GET` | `/analyze/{job_id}` | Poll job status | `pending -> running -> complete -> failed` |
-| `GET` | `/insights` | List PM insights | Sorted by volume/severity, served from DB |
-| `GET` | `/insights/{id}` | Drill into one topic | Includes sample quotes and trend |
+| `GET` | `/health` | Health check | Returns `{status: ok}` |
+| `GET` | `/insights` | List PM insights | Sorted by volume; optional `?severity=HIGH\|MEDIUM\|LOW`; served from DB |
+| `GET` | `/insights/{id}` | Drill into one topic | Returns pm_insight, action, sample_quote, trend |
+| `POST` | `/ingest` | Accept conversation JSON | Validates, embeds, stores; returns `{id, status}` |
+| `POST` | `/analyze` | Trigger clustering run | Returns `202` + `{job_id, status: pending}` in <1s; CPU work in process pool |
+| `GET` | `/analyze/{job_id}` | Poll job status | `pending → running → complete → failed` |
 
 Example ingest body:
 

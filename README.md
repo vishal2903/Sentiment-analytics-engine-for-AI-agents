@@ -78,9 +78,11 @@ Progress bars show status throughout.
 
 **5. Start API**
 ```bash
-uvicorn app.main:app --reload
+uvicorn app.main:app
 ```
 Swagger UI: http://localhost:8000/docs
+
+> **Note:** Do not use `--reload` when testing `/analyze` — WatchFiles kills background jobs mid-UMAP.
 
 ---
 
@@ -88,12 +90,12 @@ Swagger UI: http://localhost:8000/docs
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/insights` | List all 27 PM insights, sorted by volume |
-| `GET` | `/insights/{id}` | Drill into one topic: insight, action, sample quote |
-| `POST` | `/ingest` | Add a conversation to the pipeline |
-| `POST` | `/analyze` | Trigger re-clustering (202 + job_id, non-blocking) |
-| `GET` | `/analyze/{job_id}` | Poll clustering job status |
 | `GET` | `/health` | Health check |
+| `GET` | `/insights` | List all 27 insights sorted by volume (optional `?severity=HIGH\|MEDIUM\|LOW`) |
+| `GET` | `/insights/{id}` | Single insight — full detail with pm_insight, action, sample_quote |
+| `POST` | `/ingest` | Add a conversation. Embeds + stores. Returns `{id, status}` |
+| `POST` | `/analyze` | Trigger re-clustering. Returns `{job_id, status: pending}` in <1s. Non-blocking. |
+| `GET` | `/analyze/{job_id}` | Poll job status: `pending → running → complete` |
 
 ---
 
@@ -187,11 +189,14 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for HLD diagrams, data model, and laten
 
 ## What I'd Do With a Month
 
+- Centroid-nearest sampling (vs random n=12) using offline cache — better GPT cluster representation with no extra DB cost
+- GPU UMAP via RAPIDS cuML — eliminates spectral init fallback, 10× faster at 500k+ rows
+- ARQ + Redis instead of ProcessPoolExecutor — persistent job queue, survives server restarts, retries on crash
+- Silhouette score sweep to auto-tune K instead of fixed K=27
+- Week-over-week trend computation (currently null in all rows)
 - BERTopic with K-Means backend: dynamic topic discovery, drift detection, auto K
-- Nightly silhouette sweep (K=10-50): no hardcoded topic count
 - Split LLM jobs: stable labels weekly, insight synthesis nightly
 - Model benchmark harness: GPT-4.1-mini vs Claude vs Gemini 3.5 Flash
-- ARQ + Redis: job persistence, retries, queue isolation
 - Per-customer cluster isolation
 - Trend anomaly detection: flag spikes above baseline for PM alerts
 - Privacy hardening: PII redaction before embedding, retention controls
