@@ -1,0 +1,82 @@
+{
+  "info": {
+    "name": "Agnost Insight Engine",
+    "description": "Sentiment analytics for conversational AI agents. Import this collection and run all endpoints.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/health",
+        "description": "Verify the API is running"
+      }
+    },
+    {
+      "name": "Ingest Conversation",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/ingest",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"demo-001\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"I cant find where to cancel my order\"},\n    {\"role\": \"assistant\", \"content\": \"I can help you with cancellation\"}\n  ],\n  \"metadata\": {\"category\": \"ORDER\"}\n}"
+        },
+        "description": "POST /ingest — validate, embed, and store a conversation"
+      }
+    },
+    {
+      "name": "List Insights",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/insights",
+        "description": "GET /insights — all 27 PM insights sorted by volume. Served from DB, zero LLM calls."
+      }
+    },
+    {
+      "name": "List Insights (HIGH severity only)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/insights?severity=HIGH",
+          "host": ["{{base_url}}"],
+          "path": ["insights"],
+          "query": [{"key": "severity", "value": "HIGH"}]
+        },
+        "description": "Filter insights by severity"
+      }
+    },
+    {
+      "name": "Get Insight Detail",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/insights/0",
+        "description": "GET /insights/{id} — drill into one cluster: full insight, action, sample quote"
+      }
+    },
+    {
+      "name": "Trigger Re-clustering",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/analyze",
+        "description": "POST /analyze — triggers background clustering job. Returns 202 + job_id immediately (<1s). CPU work runs in ProcessPoolExecutor."
+      }
+    },
+    {
+      "name": "Poll Job Status",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/analyze/REPLACE_WITH_JOB_ID",
+        "description": "GET /analyze/{job_id} — poll job status: pending → running → complete/failed"
+      }
+    }
+  ]
+}
