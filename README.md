@@ -180,6 +180,17 @@ Bitext Customer Support (HuggingFace): 26,872 rows, 27 labeled intents, updated 
 
 ---
 
+## Sample Output
+
+Real pipeline output — 27 PM insights from 26,872 conversations — is in [`sample_output/insights.json`](sample_output/insights.json). No setup needed to see what the engine produces.
+
+To hit the live API instead:
+1. Get `.env` credentials (SUPABASE_URL, SUPABASE_KEY, OPENAI_API_KEY)
+2. `uvicorn app.main:app`
+3. `curl http://localhost:8000/insights` or open http://localhost:8000/docs
+
+---
+
 ## Docs
 
 - [`REASONING.md`](REASONING.md): every architecture decision with rejected alternatives
