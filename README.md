@@ -1,8 +1,7 @@
 # Agnost Insight Engine
 
-> Sentiment analytics for conversational AI agents.
-> Drop in conversation logs → get PM-ready insights.
-> *"22% of users are blocked on refunds — up 18% this week."*
+> Turn agent conversation logs into PM-ready insights.
+> *"22% of users are stuck on refunds, up 18% this week."*
 
 Built for the Agnost Track A assignment by Vishal Sharma.
 
@@ -10,30 +9,34 @@ Built for the Agnost Track A assignment by Vishal Sharma.
 
 ## What This Does
 
-AI agents generate conversations. Most signal inside those conversations is invisible — users phrase feature requests as complaints, surface bugs without naming them, and drop off at the same friction points repeatedly. This engine ingests raw agent conversations, clusters them by semantic similarity, and surfaces structured PM-readable insights: topic, severity, trend, and recommended action.
+AI agents generate thousands of conversations. Most of the signal inside them is invisible: users phrase feature requests as complaints, hit the same friction points repeatedly, and drop off without ever saying what broke. This engine ingests raw agent conversations, clusters them by semantic similarity, and surfaces structured insights a PM can act on: what topic is spiking, how severe, what to do about it.
 
 ---
 
-## Pipeline
+## How It Works
 
 ```
 Raw conversations
-      ↓  POST /ingest or scripts/01_ingest.py
-Supabase (conversations table + pgvector)
-      ↓  scripts/02_cluster.py
-UMAP (1536-dim → 5-dim, cosine) → K-Means (K=27 clusters)
-ARI validation against ground-truth labels
-      ↓  scripts/03_label.py
-GPT-4.1-mini (27 calls) → topic labels + PM insights
-      ↓  stored in Supabase clusters table
+      |  POST /ingest or scripts/01_ingest.py
+      v
+Supabase (conversations + pgvector)    +    .cache/embeddings.npy
+      |  scripts/02_cluster.py                      |
+      |  (reads .cache/, never DB) ◄────────────────┘
+      v
+UMAP (1536-dim to 5-dim, cosine) + K-Means (K=27, ARI=0.67)
+      |  scripts/03_label.py
+      v
+GPT-4.1-mini (27 calls) generates topic labels + PM insights
+      |  stored in Supabase insights table
+      v
 GET /insights
 ```
 
-**Key design rule:** all heavy computation runs offline. The API serves from pre-computed DB rows — zero LLM calls at request time. `GET /insights` returns in ~110ms.
+Heavy computation runs offline. The API serves pre-computed DB rows: zero LLM calls at request time, ~110ms response.
 
 ---
 
-## Algorithm & Time Complexity
+## Algorithm & Complexity
 
 | Step | Algorithm | Complexity |
 |---|---|---|
@@ -41,15 +44,15 @@ GET /insights
 | Dim reduction | UMAP cosine | O(n log n) |
 | Clustering | K-Means | O(n · k · i) |
 | ARI validation | Adjusted Rand Index | O(n) |
-| Centroid sampling | L2 distance to mean | O(n_cluster · d) |
+| Centroid sampling | L2 distance to mean (production path) | O(n_cluster · d) |
 | ANN vector search | ivfflat index | O(log n) |
 | GET /insights | SQL SELECT 27 rows | O(1) |
 
-CPU-bound clustering runs in `ProcessPoolExecutor` — separate OS process, event loop stays free. `POST /analyze` returns 202 in <1 second.
+CPU-bound clustering runs in `ProcessPoolExecutor`: separate OS process, event loop stays free. `POST /analyze` returns 202 in under 1 second.
 
 ---
 
-## Setup (5 steps)
+## Setup
 
 **1. Clone + install**
 ```bash
@@ -58,48 +61,47 @@ cd Sentiment-analytics-engine-for-AI-agents
 pip install -r requirements.txt
 ```
 
-**2. Set env vars**
+**2. Configure**
 ```bash
 cp .env.example .env
 # Fill in: OPENAI_API_KEY, SUPABASE_URL, SUPABASE_KEY
 ```
 
-**3. Set up Supabase database**
+**3. Set up Supabase**
 - Create a free project at [supabase.com](https://supabase.com)
-- Copy your project URL and anon key into `.env`
-- In the SQL editor, run the contents of `schema.sql`
+- Copy project URL and anon key into `.env`
+- Run `schema.sql` in the SQL editor
 
-**4. Run pipeline (one time, ~10 minutes)**
+**4. Run the pipeline** (one time, ~10 min)
 ```bash
 python scripts/run_pipeline.py
 ```
-Loads 26,872 conversations, embeds in batches, clusters, generates 27 PM insights.
-Progress bars show status throughout.
+Loads 26,872 conversations, embeds in batches of 100, clusters into 27 topics, generates PM insights. Progress bars throughout.
 
-**5. Start API**
+**5. Start the API**
 ```bash
 uvicorn app.main:app
 ```
 Swagger UI: http://localhost:8000/docs
 
-> **Note:** Do not use `--reload` when testing `/analyze` — WatchFiles kills background jobs mid-UMAP.
+> Do not use `--reload` when testing `/analyze`. WatchFiles kills background jobs mid-UMAP.
 
 ---
 
 ## API Reference
 
-| Method | Endpoint | Purpose |
+| Method | Endpoint | What it does |
 |---|---|---|
 | `GET` | `/health` | Health check |
-| `GET` | `/insights` | List all 27 insights sorted by volume (optional `?severity=HIGH\|MEDIUM\|LOW`) |
-| `GET` | `/insights/{id}` | Single insight — full detail with pm_insight, action, sample_quote |
+| `GET` | `/insights` | All 27 insights sorted by volume. Filter: `?severity=HIGH\|MEDIUM\|LOW` |
+| `GET` | `/insights/{id}` | Full detail: pm_insight, action, sample_quote, trend |
 | `POST` | `/ingest` | Add a conversation. Embeds + stores. Returns `{id, status}` |
-| `POST` | `/analyze` | Trigger re-clustering. Returns `{job_id, status: pending}` in <1s. Non-blocking. |
-| `GET` | `/analyze/{job_id}` | Poll job status: `pending → running → complete` |
+| `POST` | `/analyze` | Trigger re-clustering. Returns `{job_id, status: pending}` in under 1s |
+| `GET` | `/analyze/{job_id}` | Poll job status: `pending -> running -> complete` |
 
 ---
 
-## Sample Requests & Responses
+## Sample Requests
 
 **Ingest a conversation**
 ```bash
@@ -123,8 +125,8 @@ curl http://localhost:8000/insights
 ```
 ```json
 [
-  {"id": 3, "topic_label": "Refund policy confusion", "percentage": 22.1, "severity": "HIGH", "week_over_week": 18.3},
-  {"id": 7, "topic_label": "Order cancellation", "percentage": 15.4, "severity": "HIGH", "week_over_week": -2.1}
+  {"id": 3, "topic_label": "Refund policy confusion", "percentage": 22.1, "severity": "HIGH"},
+  {"id": 7, "topic_label": "Order cancellation", "percentage": 15.4, "severity": "HIGH"}
 ]
 ```
 
@@ -136,13 +138,12 @@ curl http://localhost:8000/insights/3
 {
   "id": 3,
   "topic_label": "Refund policy confusion",
-  "pm_insight": "1 in 5 users is blocked on refunds — volume up 18% this week",
+  "pm_insight": "1 in 5 users is blocked on refunds, volume up 18% this week",
   "severity": "HIGH",
   "action": "Audit return policy copy on checkout page",
   "sample_quote": "I cant find where to return my item",
   "volume": 5931,
-  "percentage": 22.1,
-  "week_over_week": 18.3
+  "percentage": 22.1
 }
 ```
 
@@ -153,9 +154,8 @@ curl -X POST http://localhost:8000/analyze
 ```json
 {"job_id": "abc-123", "status": "pending"}
 ```
-Returns in <1 second. Clustering runs in background.
 
-**Poll job status**
+**Poll job**
 ```bash
 curl http://localhost:8000/analyze/abc-123
 ```
@@ -165,38 +165,38 @@ curl http://localhost:8000/analyze/abc-123
 
 ---
 
-## Testing
+## Tests
 
 ```bash
 pytest tests/ -v
 ```
+11 tests, all passing.
 
 ---
 
 ## Dataset
 
-Bitext Customer Support (HuggingFace) — 26,872 rows, 27 labeled intents, updated October 2025.
-Ground-truth labels enable ARI validation (proves clusters track real intent, not noise).
+Bitext Customer Support (HuggingFace): 26,872 rows, 27 labeled intents, updated October 2025. Ground-truth labels enable ARI validation (ARI=0.67, target >0.3), which proves clusters reflect real user intent rather than noise.
 
 ---
 
-## Architecture & Decisions
+## Docs
 
-See [`REASONING.md`](REASONING.md) for every architectural decision with rejected alternatives.
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for HLD diagrams, data model, and latency profile.
+- [`REASONING.md`](REASONING.md): every architecture decision with rejected alternatives
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): data model, API reference, latency profile
 
 ---
 
-## What I'd Do With a Month
+## What I'd Build With a Month
 
-- Centroid-nearest sampling (vs random n=12) using offline cache — better GPT cluster representation with no extra DB cost
-- GPU UMAP via RAPIDS cuML — eliminates spectral init fallback, 10× faster at 500k+ rows
-- ARQ + Redis instead of ProcessPoolExecutor — persistent job queue, survives server restarts, retries on crash
-- Silhouette score sweep to auto-tune K instead of fixed K=27
+- Centroid-nearest sampling instead of random n=12: better GPT cluster representation, vectors are already in the offline cache
+- GPU UMAP via RAPIDS cuML: eliminates spectral init fallback, 10x faster at 500k+ rows
+- ARQ + Redis instead of ProcessPoolExecutor: persistent job queue, survives server restarts, retries on crash
+- Silhouette sweep to auto-tune K instead of fixed K=27
 - Week-over-week trend computation (currently null in all rows)
-- BERTopic with K-Means backend: dynamic topic discovery, drift detection, auto K
+- BERTopic: dynamic topic discovery, drift detection, no hardcoded K
 - Split LLM jobs: stable labels weekly, insight synthesis nightly
-- Model benchmark harness: GPT-4.1-mini vs Claude vs Gemini 3.5 Flash
+- Model benchmark: GPT-4.1-mini vs Claude vs Gemini 3.5 Flash on label consistency and cost
 - Per-customer cluster isolation
-- Trend anomaly detection: flag spikes above baseline for PM alerts
-- Privacy hardening: PII redaction before embedding, retention controls
+- Trend anomaly alerts for PMs
+- PII redaction before embedding

@@ -6,24 +6,9 @@ Agnost already lives close to the most valuable product signal: real conversatio
 
 ---
 
-## Evaluator Checklist
+## The Input Contract
 
-What this repo is designed to ship over a weekend:
-- **Ingestion contract:** any agent conversation normalized into `{ session_id, messages[], metadata }`
-- **DB choice:** Supabase Postgres + pgvector, because this is vector storage plus SQL analytics
-- **Clustering:** UMAP + K-Means for the demo, with ARI validation against Bitext labels
-- **LLM layer:** GPT-4.1 mini converts cluster stats into structured PM insights
-- **API:** FastAPI endpoints for ingest, analyze, list insights, and drill-down
-- **Scale path:** ProcessPoolExecutor for demo jobs, ARQ + Redis for production jobs, Celery only when worker scale demands it
-- **Month plan:** BERTopic, drift detection, per-customer isolation, split LLM jobs, anomaly alerts, model benchmark harness
-
----
-
-## Input -> Processing -> Output
-
-**What goes in**
-
-Any conversational AI agent sends logs via a POST call:
+Any conversational AI agent sends logs via `POST /ingest`:
 
 ```json
 {
@@ -36,40 +21,12 @@ Any conversational AI agent sends logs via a POST call:
 }
 ```
 
-Schema design, and why this structure:
-- It matches the shape Agnost can extract from OpenTelemetry-style agent traces: session, turns, metadata.
-- `messages[]` with `role/content` is the common LLM conversation object across OpenAI, Anthropic, Vercel AI SDK, and similar agent stacks.
-- `metadata` is passthrough context. The engine only requires message content, but can preserve agent_id, model, latency, customer, category, or source.
-- Bitext is only the weekend validation source. In production, Agnost's live agent logs become the source without changing the core pipeline.
+Why this shape:
+- Matches what Agnost can extract from OpenTelemetry-style agent traces: session, turns, metadata.
+- `messages[]` with `role/content` is the standard LLM conversation object across OpenAI, Anthropic, and Vercel AI SDK. No adapter layer needed for most agent stacks.
+- `metadata` is passthrough. The engine needs only message content but preserves agent_id, model, latency, or customer context if present.
 
-**How it processes**
-
-1. Each conversation -> `text-embedding-3-small` -> 1536-dim semantic vector
-2. Vectors stored in Supabase Postgres with pgvector
-3. UMAP reduces 1536 dims -> 5 dims, preserving semantic neighborhoods with cosine distance
-4. K-Means clusters into K groups: K=27 for the demo, silhouette sweep in production
-5. Per cluster: 8 centroid-nearest conversations + cluster stats -> GPT-4.1 mini -> structured insight
-6. Insights are written to Supabase and served from DB, with zero LLM calls at request time
-
-**What comes out**
-
-`GET /insights` returns PM insights sorted by volume:
-
-```json
-[{
-  "topic_label": "Refund policy confusion",
-  "percentage": 22.1,
-  "severity": "HIGH",
-  "week_over_week": "+18%",
-  "pm_insight": "1 in 5 users is blocked on refunds; volume is up 18% this week",
-  "action": "Audit return policy copy on checkout page",
-  "sample_quote": "I cant find where to return my item"
-}]
-```
-
-The output covers both examples Parth asked for. Explicit complaints like "20% of users requesting refunds due to X" show up as high-volume clusters. The more interesting output is hidden demand: users phrase feature requests as complaints, questions, or awkward workarounds. Clustering groups those conversations together even when users never say "feature request." The LLM then translates the cluster into language a PM can act on.
-
-Full API reference is in `ARCHITECTURE.md`.
+Bitext is the weekend validation source. In production, Agnost's live agent logs drop in without changing the pipeline.
 
 ---
 
@@ -103,17 +60,11 @@ That is SQL. This product is not only nearest-neighbor search. It is vector stor
 
 **Two-layer DB access strategy (important):**
 
-The Supabase Python client (PostgREST REST API) is right for runtime single-row operations — `POST /ingest` stores one conversation, `GET /insights` reads 27 rows. Low volume, low latency, clean.
+Two access paths, one database:
+- **REST (PostgREST):** right for the API layer. `POST /ingest` stores one conversation, `GET /insights` reads 27 rows. Low volume, low latency, clean.
+- **psycopg2 via Transaction Pooler (port 6543):** right for the pipeline layer. 500-row batches, each batch commits in under 5 seconds, connection released before any timeout fires. A 1536-dim embedding serialized as JSON is ~15KB per row. Inserting 27k rows via REST means hundreds of paginated HTTP calls. PostgREST is not a bulk loader.
 
-It is wrong for bulk pipeline operations. A 1536-dim embedding serialized as JSON is ~15KB per row. Inserting 27k rows via REST = hundreds of paginated HTTP calls across a public internet connection. PostgREST is not a bulk loader.
-
-For the demo, pipeline scripts use `psycopg2` via the **Transaction Pooler (port 6543)** — 500-row batches, each batch is one short transaction that commits in under 5 seconds, connection released back to pool before any timeout fires. This is the pragmatic choice: free tier, no infrastructure changes, works reliably on any network.
-
-Rule applied throughout: REST for the API layer (runtime, low volume), Transaction Pooler + psycopg2 for the pipeline layer (batch, high volume). Same database, two access paths matched to workload.
-
-**Reality check from building this:** The original plan assumed a direct TCP connection to Postgres would always be available. In practice, managed database providers increasingly restrict direct connections — IPv6-only hosts, connection limits, session duration caps — to protect shared infrastructure. Designing the pipeline around a connection abstraction (not a hardcoded `psycopg2.connect()`) means the swap to any backend is a config change, not a rewrite.
-
-**Production / Month-1 shift:** Move bulk ingest to PostgreSQL `COPY` with binary format, running from compute in the same cloud region as the database. `COPY` bypasses per-row overhead entirely — same 27k rows load in ~5 seconds instead of minutes. The pipeline code doesn't change; only the connection layer does. At 1M+ rows, this difference is the line between a nightly job that finishes before users wake up and one that runs into business hours.
+Rule: same database, two access paths matched to workload.
 
 **Rejected:**
 - Qdrant / Pinecone: strong ANN stores, but no native SQL aggregation layer for PM analytics
@@ -124,7 +75,7 @@ Rule applied throughout: REST for the API layer (runtime, low volume), Transacti
 
 ### 3. Embedding Model: Provider Interface
 
-For the demo I used `text-embedding-3-small`. I have prior integration experience with it, it keeps the weekend stack simple, and MTEB ~60 is enough to produce usable clusters on a 27k-row support dataset. It is not the best embedding model on paper. It is the right demo constraint.
+For the demo: `text-embedding-3-small`. MTEB ~60 is sufficient for clustering 27k customer support utterances, and it keeps the weekend stack simple. Not the best model on paper. The right demo constraint.
 
 The more important decision is the provider boundary:
 
@@ -164,16 +115,14 @@ K=27 is a demo shortcut, not a product assumption. It matches Bitext's 27 labele
 Key specifics:
 - `n_components=5, metric='cosine'`
 - Demo K=27 for validation against Bitext labels
-- ARI achieved: **0.67** — well above the 0.3 threshold, confirming clusters track real user intent
+- ARI achieved: **0.67**. Well above the 0.3 threshold, confirming clusters track real user intent
 - Production K discovery: silhouette sweep K=10-50, then drift/cohesion monitoring
 
-**Data loading pattern — offline store, not REST:**
+**Data loading pattern: offline store, not REST**
 
-The clustering job reads embeddings directly from a local numpy cache (`.cache/embeddings.npy`), not from the database. This is the correct separation: the database is the serving layer for the API; the offline store is the data layer for ML batch jobs. Pulling 26k × 1536-dim vectors through a REST API — with a 1000-row page limit, JSON string serialization, and public internet latency — is the wrong tool for this job regardless of the network constraint.
+The clustering job reads embeddings directly from a local numpy cache (`.cache/embeddings.npy`), not from the database. This is the correct separation: the database is the serving layer for the API; the offline store is the data layer for ML batch jobs. Pulling 26k × 1536-dim vectors through a REST API (1000-row page limit, JSON string serialization, public internet latency) is the wrong tool for this job regardless of the network constraint.
 
 The rule established here scales cleanly: swap the numpy file for a Parquet file on S3 and the clustering job runs identically at 10M rows on a cloud worker. The logic does not change. Only the storage backend does.
-
-**Production / Month-1 shift:** Restore centroid-nearest sampling for LLM labeling (currently random for the demo) using the local cache — vectors are already available offline, no DB fetch needed. Move UMAP computation to GPU (RAPIDS cuML) at 500k+ rows, cutting runtime from minutes to seconds. Offline store becomes versioned Parquet on S3 with a manifest tracking which embedding model and which dataset version produced it.
 
 **Rejected:**
 - HDBSCAN: high outlier risk on 8.7-word support utterances
@@ -196,11 +145,9 @@ Call structure:
 - Output: `{ topic_label, pm_insight, severity, action, sample_quote }`
 - Stored in Supabase so `GET /insights` never calls the LLM
 
-**Demo sampling choice — random vs centroid-nearest:**
+**Demo sampling choice: random vs centroid-nearest**
 
 The original design called for centroid-nearest sampling: find the 8 conversations geometrically closest to the cluster center, since those are the most "typical" members. For the demo, sampling is random at n=12 instead. The reasoning: with ARI at 0.67, clusters are already tight and semantically coherent. Picking 12 random conversations from a cluster of ~1000 that are all about refunds produces samples that all say "I want my refund back" regardless of their distance to the centroid. GPT gets equivalent signal at zero extra compute cost.
-
-**Production / Month-1 shift:** Restore centroid-nearest sampling using the offline numpy cache — vectors are available locally, so centroid computation costs nothing extra. Increase n to 20 for richer LLM context. Parallelize the 27 GPT calls with `asyncio` — current sequential execution takes ~68 seconds; parallel cuts it to ~8-10 seconds.
 
 Production path:
 - Keep GPT-4.1 mini if reliability/cost is good enough
@@ -249,30 +196,13 @@ Core libraries:
 
 ### 8. run_clustering_pipeline Data Access: Offline Store vs REST vs psycopg2+register_vector
 
-Decision: `.cache/embeddings.npy` offline store — same pattern as `scripts/02_cluster.py` (Phase 2).
+Decision: `.cache/embeddings.npy` offline store, same pattern as `scripts/02_cluster.py`.
 
 **Rejected:**
-- REST (PostgREST): serializes the `vector` column as a JSON string, not a float array — the pipeline cannot parse it. 1000-row hard cap causes silent truncation on a 27k-row dataset. ~165MB HTTP overhead per re-cluster run with no upside.
-- psycopg2 + `register_vector`: technically fixes the type and row-cap issues, but contradicts the project's documented layer rule — DB is the serving layer, `.cache/` is the ML data layer. Introducing a second DB access path for the same ML job creates ambiguity and erodes the rule that prevents the REST anti-pattern from recurring.
+- REST (PostgREST): serializes the `vector` column as a JSON string, not a float array. The pipeline cannot parse it. 1000-row hard cap causes silent truncation on a 27k-row dataset. ~165MB HTTP overhead per re-cluster run with no upside.
+- psycopg2 + `register_vector`: technically fixes the type and row-cap issues, but contradicts the documented layer rule: DB is the serving layer, `.cache/` is the ML data layer. Introducing a second DB access path for the same ML job creates ambiguity and erodes the rule that prevents the REST anti-pattern from recurring.
 
 Chosen because it is the pattern already proven in Phase 2, costs zero network, and is consistent with the anti-pattern rules already established. Production path: versioned Parquet on S3, same clustering logic, swap file path only.
-
----
-
-## Assumptions
-
-**K=27 is for validation, not production**
-- Bitext has 27 labeled intents, so K=27 enables ARI validation.
-- Unknown production data should use silhouette sweep, BERTopic, or both.
-
-**LLM calls are pre-computed**
-- Demo combines label + insight in one call per cluster.
-- Production should split stable labeling from nightly synthesis once customers scale.
-
-**Clustering runs in the background**
-- UMAP + K-Means is CPU-bound.
-- Demo uses `ProcessPoolExecutor`.
-- Production should use ARQ + Redis, with Celery only when worker distribution demands it.
 
 ---
 
@@ -282,8 +212,8 @@ Chosen because it is the pattern already proven in Phase 2, costs zero network, 
 |---|---|---|
 | Data source | Bitext, 27 ground-truth intents | Agnost OTel-style SDK logs |
 | Embeddings | `text-embedding-3-small` | Qwen3 or Gemini Embedding 2 behind provider interface |
-| Bulk ingest connection | psycopg2 via Transaction Pooler (port 6543), 500-row batches | PostgreSQL `COPY` binary format from same-region compute — 10-100x faster, industry standard |
-| Clustering data layer | Local numpy cache (`.cache/embeddings.npy`) | Versioned Parquet on S3 — same code, swapped storage backend |
+| Bulk ingest connection | psycopg2 via Transaction Pooler (port 6543), 500-row batches | PostgreSQL `COPY` binary format from same-region compute: 10-100x faster, zero logic change |
+| Clustering data layer | Local numpy cache (`.cache/embeddings.npy`) | Versioned Parquet on S3: same clustering code, only the file path swaps |
 | Clustering algorithm | UMAP + K-Means, K=27, ARI=0.67 | BERTopic + silhouette sweep + drift monitoring |
 | Cluster write-back | psycopg2 batch UPDATE via Transaction Pooler | Same pattern or COPY-style bulk update |
 | LLM sampling | Random, n=12 per cluster | Centroid-nearest from offline cache, n=20, async parallel calls |
@@ -291,16 +221,17 @@ Chosen because it is the pattern already proven in Phase 2, costs zero network, 
 | REST pagination | 1000-row pages, client-side loop | Server-side cursor pagination or direct offline store read |
 | Jobs | ProcessPoolExecutor | ARQ + Redis, then Celery for distributed workers |
 | Tenancy | Single-company demo | Per-customer clustering isolation |
+| Job infra | ProcessPoolExecutor: demo tier 1, zero deps, event loop free | ARQ + Redis at ~50 customers, Cloud Run Jobs at 100+: zero logic change, only the dispatcher swaps |
 
 ---
 
 ## With a Month
 
-Each item below is a deliberate demo constraint being lifted, not an afterthought. The demo was built with these migrations in mind — the seams are already in the code.
+Each item below is a deliberate demo constraint being lifted, not an afterthought. The demo was built with these migrations in mind: the seams are already in the code.
 
-1. **Bulk ingest → PostgreSQL COPY binary format** from same-region cloud compute. Demo uses Transaction Pooler + psycopg2 because it is free, reliable, and network-agnostic. Production shifts to COPY because 10-100x throughput matters when ingesting live agent logs daily at customer scale. Zero code change to pipeline logic — only the connection layer swaps.
+1. **Bulk ingest → PostgreSQL COPY binary format** from same-region cloud compute. Demo uses Transaction Pooler + psycopg2 because it is free, reliable, and network-agnostic. Production shifts to COPY because 10-100x throughput matters when ingesting live agent logs daily at customer scale. Zero code change to pipeline logic: only the connection layer swaps.
 
-2. **Offline store → versioned Parquet on S3.** Demo uses a local numpy file. Production uses S3-backed Parquet with a manifest: embedding model version, dataset hash, created timestamp. The clustering job already reads from a file path — swapping the path is the entire migration.
+2. **Offline store → versioned Parquet on S3.** Demo uses a local numpy file. Production uses S3-backed Parquet with a manifest: embedding model version, dataset hash, created timestamp. The clustering job already reads from a file path: swapping the path is the entire migration.
 
 3. **BERTopic with K-Means backend:** true emerging topic discovery, drift detection, auto K. Demo hardcodes K=27 because Bitext has 27 known intents and that enables ARI validation. Production K is unknown and shifts over time.
 
@@ -312,7 +243,7 @@ Each item below is a deliberate demo constraint being lifted, not an afterthough
 
 7. **Model benchmark harness:** compare GPT-4.1 mini, Claude, and Gemini 3.5 Flash on label consistency, JSON validity, latency, and cost per cluster.
 
-8. **ARQ + Redis:** job persistence, retries, queue isolation. ProcessPoolExecutor is the correct tier-1 choice — it is the simplest thing that works and the migration to ARQ is a one-line dispatcher swap.
+8. **ARQ + Redis then Cloud Run Jobs:** ProcessPoolExecutor is the correct tier-1 choice: simplest thing that works, migration to ARQ is a one-line dispatcher swap. At 100+ customers, nightly clustering moves to Cloud Run Jobs: pay only for execution time, no always-on infra needed. `run_clustering_pipeline()` runs identically in all three tiers.
 
 9. **Per-customer isolation:** separate vector/cluster space per company.
 
@@ -320,90 +251,15 @@ Each item below is a deliberate demo constraint being lifted, not an afterthough
 
 11. **Privacy hardening:** PII redaction before embeddings, retention controls, audit logs.
 
-12. **Cloud worker for clustering jobs:** see Production Clustering section below.
-
 ---
 
-## Production Clustering: Cloud Worker Architecture
+## What the Build Revealed
 
-### The Problem With Local Execution
+Two constraints that shaped final design decisions, documented here because they affect anyone reproducing or extending this:
 
-The demo runs UMAP + K-Means on a local machine. This works at 27k rows. It breaks in production because:
+**Postgres connection portability.** Managed providers restrict direct TCP connections: IPv6-only hosts, connection limits, session duration caps. The pipeline uses a connection abstraction rather than a hardcoded `psycopg2.connect()`. Any backend swap is a config change, not a rewrite. This is why the Transaction Pooler (port 6543) is the default path, not direct Postgres.
 
-- Clustering is CPU/RAM-bound: 500k rows × 1536 dims = ~3GB RAM peak
-- Nightly jobs cannot run on a developer's laptop
-- Multiple customers mean parallel jobs — one process pool executor is not enough
-- No retry on crash, no job observability, no cost isolation per customer
-
-### The Migration Path (3 tiers, each justified by scale)
-
-**Tier 1 — Demo (current):** `ProcessPoolExecutor`
-- UMAP + K-Means runs in a separate OS process on the same machine
-- `POST /analyze` returns 202 immediately, event loop stays free
-- Zero dependencies, zero infra cost
-- Breaks at: multiple simultaneous jobs, machine restarts, >500k rows
-
-**Tier 2 — ARQ + Redis (first 50 customers)**
-
-```
-POST /analyze
-    → enqueue job to Redis queue (ARQ)
-    → worker process picks it up
-    → runs UMAP + K-Means
-    → writes results to Supabase
-    → marks job complete
-```
-
-- ARQ is async-native: built for FastAPI, no sync/async mismatch
-- Redis free tier (Railway/Upstash): zero infra cost until real scale
-- Job survives server restarts (persisted in Redis)
-- Retries on worker crash
-- One config line swap from ProcessPoolExecutor: `QUEUE_BACKEND=arq`
-- Deploy the worker as a separate service on Railway/Fly.io (always-on, cheap)
-
-**Tier 3 — GCP Cloud Run Jobs / AWS Lambda (100+ customers)**
-
-```
-Nightly scheduler (GCP Cloud Scheduler / AWS EventBridge)
-    → triggers Cloud Run Job (GCP) or Lambda (AWS)
-    → job pulls customer's vectors from Supabase
-    → runs UMAP + K-Means on cloud VM
-    → writes cluster_ids + insights back
-    → terminates (pay only for compute used)
-```
-
-GCP Cloud Run Jobs:
-- Runs a container, pays only for execution time
-- Memory: pick 4GB or 8GB instance — handles 500k rows comfortably
-- Nightly UMAP for one customer: ~90s × $0.00002/vCPU-second ≈ $0.002 per run
-- At 50 customers nightly: ~$0.10/day
-- No always-on server needed
-
-AWS Lambda alternative:
-- 15-minute timeout limit — tight for large UMAP runs
-- Better fit for the LLM labeling job (27 calls, ~60s total) than for UMAP
-- Use Lambda for Phase 3 (labeling), Cloud Run for Phase 2 (clustering)
-
-### Code Change Required
-
-Zero changes to the clustering logic. The only swap is the job dispatcher:
-
-```python
-# Demo
-loop.run_in_executor(executor, run_clustering_pipeline, job_id)
-
-# ARQ
-await arq_queue.enqueue_job("run_clustering_pipeline", job_id)
-
-# Cloud Run Job (triggered externally, not from API)
-# POST /analyze creates DB record, Cloud Scheduler triggers the container
-```
-
-`run_clustering_pipeline()` in `app/services/clusterer.py` runs identically in all three tiers. The function does not know or care where it runs.
-
-### Why This Is Already Designed In
-
-The `ProcessPoolExecutor` decision in the demo is not a shortcut — it is tier 1 of a deliberate 3-tier job strategy. The separation of `POST /analyze` (API layer, returns immediately) from `run_clustering_pipeline` (worker, runs anywhere) is the architectural seam that makes the cloud migration a config change, not a rewrite.
+**REST client blind spots on ML data.** The Supabase REST client silently serializes `vector` columns as JSON strings and enforces a 1000-row hard cap with no error. Both are invisible: the pipeline runs, produces wrong output. The solution is the offline store rule: `.cache/embeddings.npy` for all ML reads, REST only for the API serving layer. Decision 8 documents the specifics.
 
 ---
 
